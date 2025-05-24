@@ -16,8 +16,9 @@
     let controlsVisible = true;
     let remoteStream = null;
     let peerConnection = null;
-    let isHost = false;
-    let roomId = null;
+    let isHost = false; // Will be set in criarSalaRedirecionamento or configurarWebRTCCliente
+    let roomId = null; // Will be set in criarSalaRedirecionamento or configurarWebRTCCliente
+    let websocket = null; // WebSocket connection
     
     // Configuração do servidor STUN para WebRTC
     const configuration = {
@@ -75,20 +76,40 @@
     
     // Função para criar sala de redirecionamento
     async function criarSalaRedirecionamento() {
-        roomId = Math.random().toString(36).substring(2, 15);
-        isHost = true;
+        roomId = Math.random().toString(36).substring(2, 15); // Sets global roomId
+        isHost = true; // This is the host
         
-        // Criar o link
         const baseUrl = window.location.origin + window.location.pathname;
         const redirectLink = `${baseUrl}?room=${roomId}&mode=camera`;
-        
-        // Mostrar o link para o usuário
         mostrarLinkRedirecionamento(redirectLink);
+
+        websocket = new WebSocket('ws://localhost:8765');
+        setupWebSocketEventHandlers(); // Setup global handlers for onmessage, onerror, onclose
+
+        websocket.onopen = () => {
+            console.log('Host WebSocket connected');
+            sendMessage({ type: 'join' }); // sendMessage will add { room: roomId }
+        };
         
-        // Configurar WebRTC como host
-        await configurarWebRTCHost();
+        // Initialize RTCPeerConnection for the host
+        peerConnection = new RTCPeerConnection(configuration);
+
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+                console.log('Host: Sending ICE Candidate:', event.candidate);
+                sendMessage({ type: 'ice-candidate', candidate: event.candidate });
+            }
+        };
+
+        peerConnection.ontrack = (event) => {
+            console.log('Host: Recebendo stream remoto');
+            remoteStream = event.streams[0];
+            // Ensure video element is created or updated for the remote stream
+            substituirCamera(remoteStream, true); 
+        };
         
-        criarNotificacao("Sala criada! Compartilhe o link para conectar outro dispositivo.");
+        criarNotificacao("Sala criada! Compartilhe o link. Aguardando conexão do cliente...");
+        // No longer calling configurarWebRTCHost()
     }
     
     function mostrarLinkRedirecionamento(link) {
@@ -160,90 +181,56 @@
         document.body.appendChild(modal);
     }
     
-    // Configurar WebRTC como host (recebe vídeo)
-    async function configurarWebRTCHost() {
-        peerConnection = new RTCPeerConnection(configuration);
-        
-        peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
-                // Em um cenário real, você enviaria isso via servidor de sinalização
-                console.log('ICE Candidate:', event.candidate);
-            }
-        };
-        
-        peerConnection.ontrack = (event) => {
-            console.log('Recebendo stream remoto');
-            remoteStream = event.streams[0];
-            substituirCamera(remoteStream, true);
-        };
-        
-        // Simular sinalização local (em produção, use um servidor WebSocket)
-        window.addEventListener('message', async (event) => {
-            if (event.data.type === 'offer' && event.data.roomId === roomId) {
-                await peerConnection.setRemoteDescription(event.data.offer);
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-                
-                // Enviar resposta
-                window.postMessage({
-                    type: 'answer',
-                    answer: answer,
-                    roomId: roomId
-                }, '*');
-            }
-            
-            if (event.data.type === 'ice-candidate' && event.data.roomId === roomId) {
-                await peerConnection.addIceCandidate(event.data.candidate);
-            }
-        });
-    }
+    // The function configurarWebRTCHost is now removed. 
+    // Its peerConnection setup is moved to criarSalaRedirecionamento.
+    // Its message handling (offer, ice-candidate) is covered by global websocket.onmessage (handleWebSocketMessage).
     
     // Configurar WebRTC como cliente (envia vídeo)
-    async function configurarWebRTCCliente(roomId) {
+    async function configurarWebRTCCliente(currentRoomIdFromUrl) { // Parameter name is specific
+        roomId = currentRoomIdFromUrl; // Set the global roomId for the client
+        isHost = false; // This is the client
+
+        websocket = new WebSocket('ws://localhost:8765');
+        setupWebSocketEventHandlers(); // Setup global handlers for onmessage, onerror, onclose
+
+        websocket.onopen = () => {
+            console.log('Client WebSocket connected');
+            sendMessage({ type: 'join' }); // sendMessage will add { room: roomId }
+        };
+        
+        // Offer creation is now deferred until 'room_full' message is received via WebSocket.
+
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ 
-                video: { 
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
                     width: { ideal: 1280 },
                     height: { ideal: 720 }
-                }, 
-                audio: false 
+                },
+                audio: false
             });
-            
+
             peerConnection = new RTCPeerConnection(configuration);
-            
+
             stream.getTracks().forEach(track => {
                 peerConnection.addTrack(track, stream);
             });
-            
+
             peerConnection.onicecandidate = (event) => {
                 if (event.candidate) {
-                    // Enviar candidate
-                    window.opener.postMessage({
-                        type: 'ice-candidate',
-                        candidate: event.candidate,
-                        roomId: roomId
-                    }, '*');
+                    console.log('Client: Sending ICE Candidate:', event.candidate);
+                    sendMessage({ type: 'ice-candidate', candidate: event.candidate });
                 }
             };
             
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
+            // REMOVED: Old offer creation and sending via postMessage
+            // const offer = await peerConnection.createOffer();
+            // await peerConnection.setLocalDescription(offer);
+            // window.opener.postMessage(... offer ...);
             
-            // Enviar offer
-            window.opener.postMessage({
-                type: 'offer',
-                offer: offer,
-                roomId: roomId
-            }, '*');
+            // REMOVED: Old event listener for answers via postMessage
+            // window.addEventListener('message', async (event) => { ... answer ... });
             
-            // Escutar resposta
-            window.addEventListener('message', async (event) => {
-                if (event.data.type === 'answer' && event.data.roomId === roomId) {
-                    await peerConnection.setRemoteDescription(event.data.answer);
-                }
-            });
-            
-            // Mostrar preview da câmera
+            // Mostrar preview da câmera (UI setup)
             const video = document.createElement('video');
             video.srcObject = stream;
             video.autoplay = true;
@@ -286,14 +273,15 @@
     
     function criarControlPanel() {
         // Verificar se é modo câmera (dispositivo remoto)
-        const urlParams = new URLSearchParams(window.location.search);
-        const roomId = urlParams.get('room');
-        const mode = urlParams.get('mode');
+        // Use local variables for URL parsing to avoid conflict with global roomId
+        const localUrlParams = new URLSearchParams(window.location.search);
+        const roomIdFromUrl = localUrlParams.get('room'); // Specific variable for URL param
+        const modeFromUrl = localUrlParams.get('mode'); // Specific variable for URL param
         
-        if (mode === 'camera' && roomId) {
+        if (modeFromUrl === 'camera' && roomIdFromUrl) {
             // Dispositivo remoto - configurar como cliente
-            configurarWebRTCCliente(roomId);
-            return;
+            configurarWebRTCCliente(roomIdFromUrl); // Pass the roomId from URL
+            return; // Stop further execution for client page, as it has its own UI
         }
         
         // Painel de controle principal
@@ -566,14 +554,31 @@
         }
     }
     
-    function criarNotificacao(mensagem) {
+    function criarNotificacao(mensagem, type = 'info') { // Added type parameter
         const notification = document.createElement('div');
         notification.textContent = mensagem;
         notification.style.position = 'fixed';
         notification.style.bottom = '20px';
         notification.style.left = '50%';
         notification.style.transform = 'translateX(-50%)';
-        notification.style.backgroundColor = 'rgba(46, 125, 50, 0.9)';
+        
+        // Set background color based on type
+        switch (type) {
+            case 'success':
+                notification.style.backgroundColor = 'rgba(76, 175, 80, 0.9)'; // Brighter green
+                break;
+            case 'warning':
+                notification.style.backgroundColor = 'rgba(255, 152, 0, 0.9)'; // Orange
+                break;
+            case 'error':
+                notification.style.backgroundColor = 'rgba(244, 67, 54, 0.9)'; // Red
+                break;
+            case 'info':
+            default:
+                notification.style.backgroundColor = 'rgba(46, 125, 50, 0.9)'; // Default green
+                break;
+        }
+        
         notification.style.color = 'white';
         notification.style.padding = '12px 20px';
         notification.style.borderRadius = '5px';
@@ -599,12 +604,152 @@
         }, 3000);
     }
     
+    // Helper function to send messages via WebSocket
+    function sendMessage(payload) {
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            // Ensure 'room' (not 'roomId') is part of the payload for the server
+            const messageWithRoom = { ...payload, room: roomId };
+            websocket.send(JSON.stringify(messageWithRoom));
+            console.log('Sent message:', messageWithRoom);
+        } else {
+            console.error('WebSocket not connected or not open. Cannot send message:', payload);
+        }
+    }
+
+    // Definition of the WebSocket message handler function
+    // This function will be assigned to websocket.onmessage after websocket is initialized
+    async function handleWebSocketMessage(event) {
+        const message = JSON.parse(event.data);
+        console.log('Received message:', message);
+
+        // Allow join_ack, room_full, and error without strict room check initially, or if room is not set yet
+        if (message.type !== 'join_ack' && message.type !== 'room_full' && message.type !== 'error' && message.room !== roomId) {
+            console.warn(`Message for room ${message.room} ignored, current room is ${roomId}. Message type: ${message.type}`);
+            return;
+        }
+
+        switch (message.type) {
+            case 'join_ack':
+                criarNotificacao(message.message || "Successfully joined room.", 'success');
+                break;
+            case 'room_full':
+                if (!isHost && peerConnection) { // Client side
+                    criarNotificacao("Participant connected! Initiating WebRTC call...", 'success');
+                    console.log("Client: Room is full, creating offer.");
+                    try {
+                        const offer = await peerConnection.createOffer();
+                        await peerConnection.setLocalDescription(offer);
+                        sendMessage({ type: 'offer', offer: offer });
+                    } catch (error) {
+                        console.error("Client: Error creating offer:", error);
+                        criarNotificacao("Error creating WebRTC offer.", 'error');
+                    }
+                } else if (isHost) {
+                     criarNotificacao("Another participant joined. Waiting for their offer...", 'info');
+                }
+                break;
+            case 'offer': // Host side
+                if (isHost && peerConnection) {
+                    console.log('Host: Received offer');
+                    try {
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        sendMessage({ type: 'answer', answer: answer });
+                    } catch (error) {
+                        console.error("Host: Error processing offer or creating answer:", error);
+                        criarNotificacao("Error processing WebRTC offer.", 'error');
+                    }
+                }
+                break;
+            case 'answer': // Client side
+                if (!isHost && peerConnection) {
+                    console.log('Client: Received answer');
+                    try {
+                        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+                    } catch (error) {
+                        console.error("Client: Error setting remote description from answer:", error);
+                        criarNotificacao("Error processing WebRTC answer.", 'error');
+                    }
+                }
+                break;
+            case 'ice-candidate':
+                if (peerConnection) {
+                    console.log(`${isHost ? 'Host' : 'Client'}: Received ICE candidate`);
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    } catch (error) {
+                        console.error(`${isHost ? 'Host' : 'Client'}: Error adding ICE candidate:`, error);
+                    }
+                }
+                break;
+            case 'peer_left':
+                criarNotificacao("O outro participante desconectou.");
+                console.log("Peer has left the room. Closing connection.");
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+                if (isHost) {
+                    // Optionally, re-initialize host to wait for a new client
+                    console.log("Host: Peer connection closed. User may need to re-create room.");
+                    // UI could be updated to reflect that the host is now waiting again.
+                    // For now, manual re-creation of room is expected.
+                } else { // Client
+                    document.body.innerHTML = '<div style="text-align: center; padding-top: 50px; font-family: sans-serif; font-size: 18px;">Connection closed. The other participant disconnected. You can close this window.</div>';
+                }
+                break;
+            case 'error': // Error messages from server
+                 criarNotificacao(`Server error: ${message.message}`, 'error');
+                 console.error('Server error:', message.message);
+                 break;
+            default:
+                console.log('Unknown message type received:', message.type);
+        }
+    }
+
+    function setupWebSocketEventHandlers() {
+        if (!websocket) {
+            console.error("WebSocket object not initialized, cannot set up event handlers.");
+            return;
+        }
+
+        websocket.onopen = () => {
+            console.log("WebSocket connection established.");
+            // The actual join message is sent from within criarSalaRedirecionamento or configurarWebRTCCliente's own onopen
+            // This global onopen can be for a general "connected to signaling" notification if needed,
+            // but specific join logic remains where it is to ensure it has correct context (roomId, isHost).
+            // For now, the specific onopen handlers in host/client functions will provide join confirmation.
+            // We can add a general success notification here if desired:
+            criarNotificacao("Successfully connected to signaling server!", "success");
+        };
+        
+        websocket.onmessage = handleWebSocketMessage; // Assign the async function
+
+        websocket.onerror = (event) => {
+            console.error("WebSocket error observed:", event);
+            criarNotificacao("Error connecting to signaling server. Please check if the server is running and try again.", "error");
+            // Potentially disable UI elements that require WebSocket here.
+        };
+
+        websocket.onclose = (event) => {
+            console.log("WebSocket connection closed:", event.code, event.reason);
+            criarNotificacao("Disconnected from signaling server. Please refresh to reconnect.", "warning");
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            websocket = null; // Nullify websocket object
+            // Consider UI updates, e.g., disable buttons that need websocket.
+        };
+    }
+
     // Inicializar interface
     criarControlPanel();
     
     // Mostrar dica inicial (apenas se não for modo câmera)
-    const urlParams = new URLSearchParams(window.location.search);
-    if (!urlParams.get('mode')) {
+    const currentUrlParams = new URLSearchParams(window.location.search); // Renamed to avoid conflict
+    if (!currentUrlParams.get('mode')) {
         setTimeout(() => {
             criarNotificacao("Use as setas do teclado para mover e dar zoom! Tecla H para esconder controles.");
         }, 1000);
